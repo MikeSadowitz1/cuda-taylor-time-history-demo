@@ -1,5 +1,6 @@
 # cuda-taylor-time-history-demo
 A 6D Taylor-series + ring-buffer demo in CUDA (“hello world” through derivatives)
+Now with a persistent kernel and streaming host updates
 
 # Taylor 6D CUDA "Hello World"
 
@@ -8,10 +9,10 @@ This project is a small but fully 6-dimensional CUDA demo that combines:
 - A **6D flattened tensor layout**: `(X, Y, Z, x, y, z)` → single linear index  
 - **Taylor-series reconstruction** of a continuous analytic variable (time)  
 - A **discrete message channel** (`VAR_MSG`) stored in a ring buffer along the `z` (history) dimension  
-- A debug kernel that reconstructs both **time** and a **"hello world"** message from the stored history
+- A persistent CUDA kernel that runs in a while (true) loop and reacts to live host updates, that reconstructs both **time** and a **"hello world"** message from the stored history
+- A simple host↔device handshake that streams characters into the GPU over “cycles”
 
-It’s essentially a toy “physics/fields + message” engine that shows how to mix **continuous derivatives** (good for Taylor) with **discrete events** (good for direct history lookup) in one unified 6D state array on the GPU.
-
+It’s essentially a toy “physics/fields + message” engine that shows how to mix **continuous derivatives** (good for Taylor) with **discrete events** (good for direct history lookup) & Uses a persistent GPU kernel as a long-lived worker that watches shared state and updates continuously as the host streams new data.
 ---
 
 ## Core Ideas
@@ -85,69 +86,203 @@ The history naturally wraps once CYC >= zs
 
 We never apply Taylor to VAR_MSG. Instead, we reconstruct the message by directly reading past history slices.
 
-4. Debug Kernel: Printing Time + "hello world"
-debugPrintKernel runs as a single-thread inspection kernel:
+4. Persistent Kernel + Streaming From the Host
 
-Reconstructs a target time using Taylor on VAR_T
+The original version launched three kernels per time step:
 
-Reconstructs the "helloworld" string by scanning the VAR_MSG history along z
+injectMsgHistoryKernel()
 
-Once enough cycles have passed to fill the message, it prints lines like:
+fillKsKernel()
+
+debugPrintKernel()
+
+The updated version introduces a persistent kernel:
+
+__global__
+void persistentKernel(double* E,
+                      volatile int* d_cycle,
+                      volatile int* d_quit,
+                      volatile int* d_done)
+{
+    __shared__ int lastCycle;
+    // initialize lastCycle...
+
+    while (true) {
+        // 1) Check for quit signal
+        // 2) Read the current cycle from host-mapped memory
+        // 3) If new cycle, update derivatives in E
+        // 4) Optionally print debug output ("hello world")
+        // 5) Signal back to the host that this cycle is done
+    }
+}
+
+How it works
+
+The host and device share a small set of control integers in mapped pinned memory:
+
+cycle – which cycle the kernel should process
+
+done – last cycle fully processed by the kernel
+
+quit – flag to tell the kernel to exit
+
+The host loop does:
+
+Write the next character(s) into the host-side h_E buffer
+
+Update h_cycle = cycle
+
+Spin until h_done >= cycle (i.e., the GPU has finished that cycle)
+
+Move on to the next cycle
+
+The persistent kernel:
+
+Reads *d_cycle (via volatile pointer)
+
+If curCycle != lastCycle, it:
+
+Fills analytic time derivatives for VAR_T
+
+Computes finite-difference derivatives for VAR_MSG
+
+Optionally prints a debug line once enough history is present
+
+Updates lastCycle and writes *d_done = curCycle so the host knows it’s done
+
+If *d_quit != 0, it breaks out of the loop and returns
+
+This pattern turns the kernel into a long-lived GPU worker that reacts to streaming host updates instead of being relaunched every time step.
+
+5. Debug Printing: Time + "helloworld"
+
+Inside the persistent kernel, a single designated thread (block (0,0,0), thread (0,0,0)) acts as a “debug inspector”:
+
+Reconstructs time at a target point using Taylor on VAR_T
+
+Reconstructs the "helloworld" message from the VAR_MSG ring buffer
+
+Once enough cycles have accumulated to fill the string, it prints lines like:
 
 CYC= 9  t_cur= 9.0  t_back= 2.0  msg_back=helloworld
-The msg_back string is built from the characters stored in the ring buffer.
+CYC=10  t_cur=10.0  t_back= 2.0  msg_back=helloworld
+...
+
+
+msg_back is built by reading VAR_MSG at each history slot z_j = j % zs and converting the stored double back to char.
 
 Code Structure
 UID_6D(...)
 6D → 1D index mapping for the unified state array E.
-
 reconstructTemporalValueForOrder(...)
 Device function implementing Taylor-series reconstruction for continuous variables (used for VAR_T).
+persistentKernel(...) (new)
 
-injectMsgHistoryKernel(...)
-Injects discrete message characters into the VAR_MSG variable at the current history index z_cur.
 
-fillKsKernel(...)
-Fills derivatives for:
+Runs as a persistent, while(true) kernel
 
-VAR_T — analytic time variable with exact derivatives
 
-VAR_MSG — estimates first and second time derivatives from discrete history (finite differences).
+Watches shared state (cycle, quit, done) via volatile pointers
 
-debugPrintKernel(...)
-Single-thread kernel that prints:
 
-Current cycle CYC
+For each new cycle:
 
-Reconstructed time at a target point
 
-Reconstructed "helloworld" from the VAR_MSG history.
+Updates analytic time derivatives (VAR_T)
 
-main()
-Allocates and zeroes the GPU buffer, sets up grid/block dimensions, runs the update loop for CYC = 0..25, and launches the three kernels in sequence each step.
+
+Updates discrete message derivatives (VAR_MSG) via finite differences
+
+
+Prints debug line once the "helloworld" sequence is visible
+
+
+Signals completion to the host
+
+
+
+
+Host-Side Streaming Loop
+
+
+Uses pinned, mapped host memory for:
+
+
+E (the big 6D state array)
+
+
+cycle, done, quit (control variables)
+
+
+
+
+Each iteration:
+
+
+Injects one character of "helloworld" into the ring buffer
+
+
+Publishes a new cycle
+
+
+Waits until the persistent kernel acknowledges it processed that cycle
+
+
+
+
 
 Building and Running
 Requirements
+
+
 CUDA-capable GPU
+
 
 CUDA Toolkit (e.g. 11.x or later)
 
+
 A C++ compiler supported by your CUDA version
 
+
 Compile
-bash:
 nvcc -O2 -o ctthd ctthd.cu
 
 Run
-bash:
 ./ctthd
-You should see lines printed once enough history has accumulated, including a reconstructed "helloworld" from the VAR_MSG history.
+
+You should see lines printed once enough history has accumulated, including a reconstructed "helloworld" from the VAR_MSG history, driven by the persistent streaming kernel rather than per-step launches.
 
 Why This Might Be Interesting
+
+
 Demonstrates multi-dimensional indexing and layout for a “field of derivatives” in CUDA.
 
-Shows how to mix analytic Taylor reconstruction with discrete event history, using a ring buffer along time.
 
-Serves as a conceptual stepping stone toward more complex PDE solvers, neural fields, or time-history-based models that live on the GPU.
+Shows how to combine:
 
-Feel free to fork, modify, or adapt this as a sandbox for your own time-history + Taylor experiments.
+
+Analytic Taylor reconstruction for continuous variables (VAR_T), and
+
+
+Direct history lookups / finite differences for discrete variables (VAR_MSG),
+
+
+within a single 6D state array.
+
+
+Serves as a conceptual stepping stone toward:
+
+
+Persistent-kernel designs for real-time or streaming systems
+
+
+PDE solvers or neural fields with time history on the GPU
+
+
+Low-latency ML / physics engines where the host continuously streams updates into a long-running GPU worker
+
+
+
+
+Feel free to fork, modify, or adapt this as a sandbox for your own time-history + Taylor + persistent kernel experiments.
+
