@@ -249,8 +249,7 @@ int main()
     CUDA_CHECK(cudaMalloc(&d_E, TOTAL_E * sizeof(double)));
     CUDA_CHECK(cudaMemset(d_E, 0, TOTAL_E * sizeof(double)));
 
-    // We only use one spatial point and one Y-plane per kernel, but the layout is 6D.
-    dim3 blocks(1, Ys, Zs);  // only Z=0
+    dim3 blocks(1, Ys, Zs);  
     dim3 threads(xs, ys, zs);
 
     double dt = 1.0;
