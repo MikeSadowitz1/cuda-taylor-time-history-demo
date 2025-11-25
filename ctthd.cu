@@ -1,10 +1,9 @@
-// ctthd.cu
+#include <iostream>
 #include <cstdio>
 #include <cstdlib>
 #include <cuda_runtime.h>
 #include <math.h>
 
-// ---- Problem dimensions (small but fully 6D) ----
 #define Xs  10    
 #define Ys  10
 #define Zs  10
@@ -16,28 +15,20 @@
 #define VAR_MSG    1
 
 #define TOTAL_E ((long long)Xs * Ys * Zs * xs * ys * zs)
+#define UIDS TOTAL_E
+#define CYCLES_TO_RUN 25
 
-// ---- CUDA error checking ----
-#define CUDA_CHECK(call) do { \
-    cudaError_t _e = (call); \
-    if (_e != cudaSuccess) { \
-        fprintf(stderr, "CUDA error %s at %s:%d\n", \
-                cudaGetErrorString(_e), __FILE__, __LINE__); \
-        std::exit(1); \
-    } \
-} while (0)
+#define CUDA_CHECK(call)                                                        \
+    do {                                                                        \
+        cudaError_t err__ = (call);                                             \
+        if (err__ != cudaSuccess) {                                             \
+            std::cerr << "CUDA error " << cudaGetErrorString(err__)            \
+                      << " at " << __FILE__ << ":" << __LINE__ << std::endl;   \
+            std::exit(1);                                                       \
+        }                                                                       \
+    } while (0)
 
-// ---------------------------------------------------------------------
-// UID_6D: flatten (X,Y,Z,x,y,z) into [0, TOTAL_E)
-//
-// Layout:
-//   Outer dims: [Z][Y][X]
-//   Inner dims: [z][y][x]
-//
-// E[ UID_6D(X,Y,Z,x,y,z) ] = derivative order X for variable Y
-//                           at spatial (Z,x,y) and history index z.
-// ---------------------------------------------------------------------
-__device__ __forceinline__
+__host__ __device__ __forceinline__
 long long UID_6D(int X, int Y, int Z, int x, int y, int z)
 {
     const int outerX = Xs, outerY = Ys, outerZ = Zs;
@@ -48,16 +39,9 @@ long long UID_6D(int X, int Y, int Z, int x, int y, int z)
     return outerIndex * ((long long)innerX * innerY * innerZ) + innerIndex;
 }
 
-// ---------------------------------------------------------------------
-// Taylor reconstruction for an ANALYTIC variable (e.g. time):
-//
-//   E^{(k0)}(t + h) ≈ Σ_{m=0}^{M} [ h^m / m! ] * E^{(k0+m)}(t)
-//
-// We will only use this for VAR_T (continuous time), not for VAR_MSG.
-// ---------------------------------------------------------------------
 __device__
 double reconstructTemporalValueForOrder(
-    const double* __restrict__ E,
+    const double* E,
     int k0,
     int Y, int Z, int x, int y, int z,
     double h,
@@ -97,177 +81,215 @@ double reconstructTemporalValueForOrder(
     return value_out;
 }
 
-// ---------------------------------------------------------------------
-// 1) Inject discrete message characters into VAR_MSG history.
-//
-// We treat z_cur = CYC % zs as the "current history slot" on z.
-// Here we hardcode msg(t):
-//   CYC 0 -> 'h'
-//   CYC 1 -> 'e'
-//   CYC 2 -> 'l'
-//   CYC 3 -> 'l'
-//   CYC 4 -> 'o'
-//  etc.
-// IMPORTANT: this is a discrete sequence, not a smooth function.
-// We will NOT use Taylor on VAR_MSG; just direct history lookup.
-// ---------------------------------------------------------------------
 __global__
-void injectMsgHistoryKernel(long long CYC, double* __restrict__ E)
+void persistentKernel(double* E,
+                      volatile int* d_cycle,
+                      volatile int* d_quit,
+                      volatile int* d_done)
 {
-    int Y = VAR_MSG;
-    int Z = blockIdx.z;
-    int x = threadIdx.x;
-    int y = threadIdx.y;
-    int z = threadIdx.z;      // time-history index this thread "owns"
+    __shared__ int lastCycle;
 
-    int z_cur = (int)(CYC % zs);
-    if (z != z_cur) return;   // only the current slice writes
-
-    char c = 0;
-    if      (CYC == 0) c = 'h';
-    else if (CYC == 1) c = 'e';
-    else if (CYC == 2) c = 'l';
-    else if (CYC == 3) c = 'l';
-    else if (CYC == 4) c = 'o';
-    else if (CYC == 5) c = 'w';
-    else if (CYC == 6) c = 'o';
-    else if (CYC == 7) c = 'r';
-    else if (CYC == 8) c = 'l';
-    else if (CYC == 9) c = 'd';
-    else               c = 0;  // no new character after (history remains)
-
-    if (c != 0) {
-        E[UID_6D(0, Y, Z, x, y, z)] = (double)c;
+    if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
+        lastCycle = -1;
     }
-}
+    __syncthreads();
 
-// ---------------------------------------------------------------------
-// 2) Fill analytic time variable VAR_T at z_cur.
-//
-// We define E_t(t) = t (continuous).
-//  - E^0_t(t) = t
-//  - E^1_t(t) = 1
-//  - E^k_t(t) = 0 for k>=2
-//
-// These derivatives make Taylor reconstruction EXACT for time:
-//   E_t(t_target) = t_target.
-// ---------------------------------------------------------------------
-__global__
-void fillKsKernel(long long CYC, double dt,double* __restrict__ E)
-{
-    int Y = blockIdx.y;
-    int Z = blockIdx.z;
-    int x = threadIdx.x;
-    int y = threadIdx.y;
-    int z = threadIdx.z;
+    while (true) {
 
-    int z_cur = (int)(CYC % zs);
-    if (z != z_cur) return;   // only current history slice
-
-    if (Y == VAR_T){
-        double t = (double)CYC;
-        E[UID_6D(0, Y, Z, x, y, z)] = t;    // value
-        E[UID_6D(1, Y, Z, x, y, z)] = 1.0;  // first derivative
-        for (int k = 2; k < Xs; ++k) {
-            E[UID_6D(k, Y, Z, x, y, z)] = 0.0;
+        // read quit flag from mapped memory
+        if (*d_quit != 0) {
+            return;
         }
-    } else if (Y == VAR_MSG){
-        double f0 = E[UID_6D(0, Y, Z, x, y, z)];
 
-        double d1 = 0.0;
-        double d2 = 0.0;
+        // read current cycle from mapped memory
+        int curCycle = *d_cycle;
 
-        if (CYC == 0) {
-            d1 = 0.0;
-            d2 = 0.0;
-        } else if (CYC == 1) {
-            int z_1 = (z_cur - 1 + zs) % zs;
-            double f1 = E[UID_6D(0, Y, Z, x, y, z_1)];
-            d1 = (f0 - f1) / dt;
-            d2 = 0.0;
+        if (curCycle == lastCycle) {
+            __syncthreads();
+            continue;
+        }
+
+        long long CYC = (long long)curCycle;
+        double dt = 1.0;
+        int z_cur = (int)(CYC % zs);
+
+        int X = blockIdx.x;
+        int Y = blockIdx.y;
+        int Z = blockIdx.z;
+        int x = threadIdx.x;
+        int y = threadIdx.y;
+        int z = threadIdx.z;
+
+        if (X > 0) {
+            if (z == z_cur) {
+                if (Y == VAR_T) {
+                    double t = (double)CYC;
+                    E[UID_6D(0, Y, Z, x, y, z)] = t;
+                    E[UID_6D(1, Y, Z, x, y, z)] = 1.0;
+                    for (int k = 2; k < Xs; ++k) {
+                        E[UID_6D(k, Y, Z, x, y, z)] = 0.0;
+                    }
+                } else if (Y == VAR_MSG) {
+                    double f0 = E[UID_6D(0, Y, Z, x, y, z)];
+                    double d1 = 0.0;
+                    double d2 = 0.0;
+
+                    if (CYC == 0) {
+                        d1 = 0.0;
+                        d2 = 0.0;
+                    } else if (CYC == 1) {
+                        int z_1 = (z_cur - 1 + zs) % zs;
+                        double f1 = E[UID_6D(0, Y, Z, x, y, z_1)];
+                        d1 = (f0 - f1) / dt;
+                        d2 = 0.0;
+                    } else {
+                        int z_1 = (z_cur - 1 + zs) % zs;
+                        int z_2 = (z_cur - 2 + zs) % zs;
+                        double f1 = E[UID_6D(0, Y, Z, x, y, z_1)];
+                        double f2 = E[UID_6D(0, Y, Z, x, y, z_2)];
+                        d1 = (3.0 * f0 - 4.0 * f1 + f2) / (2.0 * dt);
+                        d2 = (f0 - 2.0 * f1 + f2) / (dt * dt);
+                    }
+
+                    E[UID_6D(1, Y, Z, x, y, z)] = d1;
+                    E[UID_6D(2, Y, Z, x, y, z)] = d2;
+                }
+            }
+
+            __syncthreads();
         } else {
-            int z_1 = (z_cur - 1 + zs) % zs;
-            int z_2 = (z_cur - 2 + zs) % zs;
-            double f1 = E[UID_6D(0, Y, Z, x, y, z_1)];
-            double f2 = E[UID_6D(0, Y, Z, x, y, z_2)];
-            d1 = (3.0 * f0 - 4.0 * f1 + f2) / (2.0 * dt);
-            d2 = (f0 - 2.0 * f1 + f2) / (dt * dt);
+            if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 &&
+                threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0)
+            {
+                int msg_len = zs;
+                if (CYC >= msg_len - 1) {
+                    int Z0 = 0;
+                    int x0 = 0;
+                    int y0 = 0;
+                    int z_cur2 = z_cur;
+
+                    double t_back = reconstructTemporalValueForOrder(
+                        E, 0, VAR_T,
+                        Z0, x0, y0, z_cur2,
+                        (2.0 - (double)CYC),
+                        Xs - 1);
+
+                    printf("CYC=%2lld  t_cur=%4.1f  t_back=%4.1f  msg_back=",
+                           CYC, (double)CYC, t_back);
+
+                    for (int j = 0; j < msg_len; ++j) {
+                        int z_j = j % zs;
+                        char c = (char)(int)lrint(
+                            E[UID_6D(0, VAR_MSG, Z0, x0, y0, z_j)]
+                        );
+                        if (c == 0) c = '_';
+                        printf("%c", c);
+                    }
+                    printf("\n");
+                }
+            }
+            __syncthreads();
         }
 
-        E[UID_6D(1, Y, Z, x, y, z)] = d1;
-        E[UID_6D(2, Y, Z, x, y, z)] = d2;
+        if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
+            lastCycle = curCycle;
+        }
+        __syncthreads();
+
+        // signal to host that this cycle is done
+        if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 &&
+            threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0)
+        {
+            *d_done = curCycle;
+        }
+        __syncthreads();
     }
 }
 
-// ---------------------------------------------------------------------
-// 3) Debug/inspect kernel:
-//
-//   - Uses Taylor on VAR_T to reconstruct t_target from t and d/dt.
-//   - Uses direct z-history lookup (no Taylor) to reconstruct "helloworld".
-//
-// only
-// thread (0,0,0) prints to avoid spam.
-// ---------------------------------------------------------------------
-__global__
-void debugPrintKernel(long long CYC, const double* __restrict__ E)
-{
-    // Only one thread prints
-    if (blockIdx.x != 0 || blockIdx.y != 0 || blockIdx.z != 0 ||
-        threadIdx.x != 0 || threadIdx.y != 0 || threadIdx.z != 0)
-        return;
-
-    int msg_len = zs;
-
-    // We only start printing once enough letters have been injected
-    if (CYC < msg_len - 1) return;
-
-    int Z = blockIdx.z;
-    int x = threadIdx.x;
-    int y = threadIdx.y;
-    int z_cur = (int)(CYC % zs);
-
-    // Reconstruct time at 2.0 using VAR_T derivatives at z_cur
-    printf("CYC=%2lld  t_cur=%4.1f  t_back=%4.1f  msg_back=",CYC, ((double)CYC), reconstructTemporalValueForOrder(E,/*k0=*/0,VAR_T, Z, x, y, z_cur,(( 2.0 )-((double)CYC)),/*max_order_use=*/Xs - 1));
-
-    // Reconstruct "hello" from z-history of VAR_MSG:
-    // tick j was stored at z_j = j % zs (no wrap for CYC <= 9, zs=10)
-    for (int j = 0; j < msg_len; ++j) {
-        int z_j = j % zs;
-        char c = (char)(int)lrint( E[UID_6D(0, VAR_MSG, Z, x, y, z_j)] );   // convert stored double back to char
-        if (c == 0) c = '_';            // for safety / visualization
-        printf("%c", c);
-    }
-    printf("\n");
-}
-
-// ---------------------------------------------------------------------
-// Host driver
-// ---------------------------------------------------------------------
 int main()
 {
-    double *d_E = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_E, TOTAL_E * sizeof(double)));
-    CUDA_CHECK(cudaMemset(d_E, 0, TOTAL_E * sizeof(double)));
+    CUDA_CHECK(cudaSetDeviceFlags(cudaDeviceMapHost));
 
-    dim3 blocks(1, Ys, Zs);  
+    int *h_done = nullptr;
+    volatile int *d_done = nullptr;
+
+    CUDA_CHECK(cudaHostAlloc(&h_done, sizeof(int), cudaHostAllocMapped));
+    CUDA_CHECK(cudaHostGetDevicePointer((int**)&d_done, h_done, 0));
+    *h_done = -1;
+
+    double *h_E = nullptr;
+    double *d_E = nullptr;
+    int *h_cycle = nullptr, *h_quit = nullptr;
+    volatile int *d_cycle = nullptr, *d_quit = nullptr;
+
+    // Allocate pinned, mapped host memory for E
+    CUDA_CHECK(cudaHostAlloc(&h_E, UIDS * sizeof(double), cudaHostAllocMapped));
+    CUDA_CHECK(cudaHostGetDevicePointer(&d_E, h_E, 0));
+
+    // Allocate pinned, mapped host memory for control variables
+    CUDA_CHECK(cudaHostAlloc(&h_cycle, sizeof(int), cudaHostAllocMapped));
+    CUDA_CHECK(cudaHostAlloc(&h_quit,  sizeof(int), cudaHostAllocMapped));
+    CUDA_CHECK(cudaHostGetDevicePointer((int**)&d_cycle, h_cycle, 0));
+    CUDA_CHECK(cudaHostGetDevicePointer((int**)&d_quit,  h_quit,  0));
+
+    for (int i = 0; i < UIDS; ++i) {
+        h_E[i] = 0.0;
+    }
+    *h_cycle = 0;
+    *h_quit  = 0;
+
+    dim3 blocks(2, Ys, Zs);
     dim3 threads(xs, ys, zs);
 
-    double dt = 1.0;
+    persistentKernel<<<blocks, threads>>>(d_E, (int*)d_cycle, (int*)d_quit, (int*)d_done);
+    CUDA_CHECK(cudaGetLastError());
 
-    for (long long CYC = 0; CYC <= 25; ++CYC) {
-        injectMsgHistoryKernel<<<blocks, threads>>>(CYC, d_E);
-        CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaDeviceSynchronize());
+    // Host updates over cycles
+    for (int cycle = 0; cycle <= CYCLES_TO_RUN; ++cycle) {
 
-        fillKsKernel<<<blocks, threads>>>(CYC,dt,d_E);
-        CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaDeviceSynchronize());
+        // inject "hello world" into h_E
+        for (int Z = 0; Z < Zs; ++Z) {
+            for (int x = 0; x < xs; ++x) {
+                for (int y = 0; y < ys; ++y) {
+                    char c = 0;
+                    if      (cycle == 0) c = 'h';
+                    else if (cycle == 1) c = 'e';
+                    else if (cycle == 2) c = 'l';
+                    else if (cycle == 3) c = 'l';
+                    else if (cycle == 4) c = 'o';
+                    else if (cycle == 5) c = 'w';
+                    else if (cycle == 6) c = 'o';
+                    else if (cycle == 7) c = 'r';
+                    else if (cycle == 8) c = 'l';
+                    else if (cycle == 9) c = 'd';
+                    else c = 0;
 
-        debugPrintKernel<<<blocks, threads>>>(CYC, d_E);
-        CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaDeviceSynchronize());
+                    if (c != 0) {
+                        int uidToUpdate =
+                            UID_6D(0, VAR_MSG, Z, x, y, (cycle % zs));
+                        h_E[uidToUpdate] = (double)c;
+                    }
+                }
+            }
+        }
+
+        *h_cycle = cycle;
+
+        // Wait until GPU acknowledges this cycle
+        while (*h_done < cycle) {
+            // optional: tiny sleep
+            // std::this_thread::sleep_for(std::chrono::microseconds(10));
+        }
     }
 
-    CUDA_CHECK(cudaFree(d_E));
+    *h_quit = 1;
+
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    CUDA_CHECK(cudaFreeHost(h_E));
+    CUDA_CHECK(cudaFreeHost(h_cycle));
+    CUDA_CHECK(cudaFreeHost(h_quit));
+    CUDA_CHECK(cudaFreeHost(h_done));
+
     return 0;
 }
