@@ -1,4 +1,4 @@
-// optionA_hybrid_demo.cu
+// ctthd.cu
 #include <cstdio>
 #include <cstdlib>
 #include <cuda_runtime.h>
