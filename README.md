@@ -60,197 +60,173 @@ uses a Taylor series:
 E(k0​)(t+h)≈m=0∑M​m!hm​E(k0​+m)(t)
 to reconstruct the value at a target time t + h. Because the derivatives for VAR_T are exact, the reconstruction of time is exact as well.
 
-3. Discrete Message Channel with Ring Buffer
-For the discrete message variable VAR_MSG, we don’t pretend it’s smooth. Instead, we:
 
-Inject characters over cycles CYC = 0..9:
-0 → 'h'
-1 → 'e'
-2 → 'l'
-3 → 'l'
-4 → 'o'
-5 → 'w'
-6 → 'o'
-7 → 'r'
-8 → 'l'
-9 → 'd'
-Store the active character in the current z slice, where
-int z_cur = CYC % zs;
-This means the z dimension acts as a ring buffer / sliding window in time:
+# GPU Persistent Kernel Demo  
+### 6D Field Simulation + Live Message Streaming
 
-New data always writes into z_cur
+This project demonstrates a **multi-block persistent CUDA kernel** capable of processing a 6-dimensional data field while the host streams new updates each cycle.  
+Communication uses **mapped pinned memory** so the GPU never has to relaunch.
 
-Older values reside in the other z slots
+The demo includes:
 
-The history naturally wraps once CYC >= zs
+- A fully persistent kernel (runs until `quit=1`)
+- A custom **device-wide barrier** built from atomics
+- Temporal derivative reconstruction for the `VAR_T` field
+- A streaming message system storing characters in the **(x,z) plane**
+- Host-side and device-side reconstructions of stored data
+- Pretty printers to visualize message layout
 
-We never apply Taylor to VAR_MSG. Instead, we reconstruct the message by directly reading past history slices.
+---
 
-4. Persistent Kernel + Streaming From the Host
+## Data Model: 6D Field
 
-The original version launched three kernels per time step:
+The global array:
 
-injectMsgHistoryKernel()
+E[Xs][Ys][Zs][xs][ys][zs]
 
-fillKsKernel()
+is flattened using `UID_6D()`.  
 
-debugPrintKernel()
+Dimensions:
 
-The updated version introduces a persistent kernel:
+Xs = 10 (temporal derivative order)
+Ys = 10 (variable class: VAR_T or VAR_MSG)
+Zs = 10
+xs = 10
+ys = 10
+zs = 10 (time-ring buffer)
 
-__global__
-void persistentKernel(double* E,
-                      volatile int* d_cycle,
-                      volatile int* d_quit,
-                      volatile int* d_done)
-{
-    __shared__ int lastCycle;
-    // initialize lastCycle...
+`UID_6D()` maps the full 6D coordinate into a linear offset in `E`.
 
-    while (true) {
-        // 1) Check for quit signal
-        // 2) Read the current cycle from host-mapped memory
-        // 3) If new cycle, update derivatives in E
-        // 4) Optionally print debug output ("hello world")
-        // 5) Signal back to the host that this cycle is done
-    }
-}
+---
 
-How it works
+## Message Packing (x,z Plane)
 
-The host and device share a small set of control integers in mapped pinned memory:
+Messages are stored using:
 
-cycle – which cycle the kernel should process
+global_idx = x * zs + z
 
-done – last cycle fully processed by the kernel
+Meaning:
 
-quit – flag to tell the kernel to exit
+- Each column is a time slice (`z`)
+- Each row (`x`) increments the major index
+- Maximum message length = `xs * zs` (100 chars here)
 
-The host loop does:
+If the message is too long, the host prints:
 
-Write the next character(s) into the host-side h_E buffer
+ERROR: not enough xs*zs to store full string
 
-Update h_cycle = cycle
+and the extra characters are ignored.
 
-Spin until h_done >= cycle (i.e., the GPU has finished that cycle)
+---
 
-Move on to the next cycle
+## Persistent Kernel Logic
 
-The persistent kernel:
+The kernel:
 
-Reads *d_cycle (via volatile pointer)
+1. Starts once and **never exits** until `d_quit = 1`
+2. Polls `d_CYC` for a new cycle index
+3. Uses a device-wide barrier composed of:
+   - `g_activeCycle`
+   - `g_threadsDone`
+   - `atomicAdd` + volatile + fencing
+4. Each thread processes a strided subset of tasks:
+for t = tid; t < TOTAL_TASKS; t += numThreads
 
-If curCycle != lastCycle, it:
+5. After all work is done:
+- last thread prints GPU debug reconstruction
+- last thread sets `*d_done = CYC` with `__threadfence_system()`
 
-Fills analytic time derivatives for VAR_T
+This enables a full persistent-kernel pipeline without cooperative launch.
 
-Computes finite-difference derivatives for VAR_MSG
+---
 
-Optionally prints a debug line once enough history is present
+## Temporal Reconstruction
 
-Updates lastCycle and writes *d_done = curCycle so the host knows it’s done
+`reconstructTemporalValueForOrder()` evaluates a Taylor-like expansion using the stored derivatives in E:
 
-If *d_quit != 0, it breaks out of the loop and returns
-
-This pattern turns the kernel into a long-lived GPU worker that reacts to streaming host updates instead of being relaunched every time step.
-
-5. Debug Printing: Time + "helloworld"
-
-Inside the persistent kernel, a single designated thread (block (0,0,0), thread (0,0,0)) acts as a “debug inspector”:
-
-Reconstructs time at a target point using Taylor on VAR_T
-
-Reconstructs the "helloworld" message from the VAR_MSG ring buffer
-
-Once enough cycles have accumulated to fill the string, it prints lines like:
-
-CYC= 9  t_cur= 9.0  t_back= 2.0  msg_back=helloworld
-CYC=10  t_cur=10.0  t_back= 2.0  msg_back=helloworld
+E[0] = value
+E[1] = first derivative
+E[2] = second derivative
 ...
 
+Used for debugging and demonstration.
 
-msg_back is built by reading VAR_MSG at each history slot z_j = j % zs and converting the stored double back to char.
+---
 
-Code Structure
-UID_6D(...)
-6D → 1D index mapping for the unified state array E.
-reconstructTemporalValueForOrder(...)
-Device function implementing Taylor-series reconstruction for continuous variables (used for VAR_T).
-persistentKernel(...) (new)
+## Host-Side Debugging Tools
 
+Two helpers allow easy visualization:
 
-Runs as a persistent, while(true) kernel
+### 1. `dumpMsgLayout(h_E)`
+Prints an ASCII matrix showing the entire `(x,z)` layout.
 
+### 2. `reconstructFullMessage(h_E)`
+Rebuilds the full message (row-major in `x`, then `z`).
 
-Watches shared state (cycle, quit, done) via volatile pointers
+Example output:
 
+=== Host-side MSG layout ===
+x=0: hello_____
+x=1: world_____
+...
+Full reconstructed message (host): [helloworldwhatsgoing]
 
-For each new cycle:
+---
 
+## Build Instructions
 
-Updates analytic time derivatives (VAR_T)
+Requires:
 
+- CUDA-capable GPU supporting mapped pinned memory
+- Compute capability 7.0+ recommended (sm_70 / sm_75 / sm_80)
 
-Updates discrete message derivatives (VAR_MSG) via finite differences
+Compile with:
 
-
-Prints debug line once the "helloworld" sequence is visible
-
-
-Signals completion to the host
-
-
-
-
-Host-Side Streaming Loop
-
-
-Uses pinned, mapped host memory for:
+nvcc -O3 -std=c++17 -arch=sm_80 ctthd.cu -o ctthd
 
 
-E (the big 6D state array)
+(Adjust `sm_XX` to match your GPU.)
+
+---
+
+## Runtime Flow
+
+1. Host initializes pinned-mapped arrays
+2. Host launches persistent kernel
+3. Loop over `CYC = 0 .. CYCS_TO_RUN`:
+   - Host writes new message characters into `h_E`
+   - Host sets `h_CYC = CYC`
+   - Device completes the cycle, sets `d_done`
+   - Host waits for `h_done == CYC`
+4. Host sets `quit = 1`, GPU exits
+5. Host prints final layout & reconstructed string
+
+---
+
+## Example Kernel Output
+
+GPU debug: CYC=09 t_cur=9.0 t_back=...
+helloworldwhat
+
+Then at program end:
+
+=== Host-side MSG layout (Z=0,y=0) ===
+x=0: hello_____
+x=1: world_____
+x=2: whats_____
+...
+Full reconstructed message (host): [helloworldwhatsgoing]
 
 
-cycle, done, quit (control variables)
+---
+
+## License
+
+This project is provided for educational and experimental purposes only.  
+No warranty expressed or implied.
 
 
 
-
-Each iteration:
-
-
-Injects one character of "helloworld" into the ring buffer
-
-
-Publishes a new cycle
-
-
-Waits until the persistent kernel acknowledges it processed that cycle
-
-
-
-
-
-Building and Running
-Requirements
-
-
-CUDA-capable GPU
-
-
-CUDA Toolkit (e.g. 11.x or later)
-
-
-A C++ compiler supported by your CUDA version
-
-
-Compile
-nvcc -O2 -o ctthd ctthd.cu
-
-Run
-./ctthd
-
-You should see lines printed once enough history has accumulated, including a reconstructed "helloworld" from the VAR_MSG history, driven by the persistent streaming kernel rather than per-step launches.
 
 Why This Might Be Interesting
 
