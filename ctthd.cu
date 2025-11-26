@@ -3,6 +3,7 @@
 #include <cstdlib>
 #include <cuda_runtime.h>
 #include <math.h>
+#include <string>
 
 #define Xs  10
 #define Ys  10
@@ -81,18 +82,60 @@ double reconstructTemporalValueForOrder(
     return value_out;
 }
 
-// Per-cycle barrier state
-// Per-cycle barrier state
+// -------- Host-side helpers to inspect VAR_MSG (x,z) layout --------
+
+void dumpMsgLayout(const double* h_E, int Z0 = 0, int y0 = 0)
+{
+    printf("\n=== Host-side MSG layout (Z=%d, y=%d) ===\n", Z0, y0);
+    printf("rows: x = 0..%d,  cols: z = 0..%d\n", xs - 1, zs - 1);
+
+    for (int x = 0; x < xs; ++x) {
+        printf("x=%2d: ", x);
+        for (int z = 0; z < zs; ++z) {
+            char c = (char)(int)lrint(h_E[UID_6D(0,VAR_MSG,Z0,x,y0,z)]);
+            if (c == 0) c = '_';
+            printf("%c", c);
+        }
+        printf("\n");
+    }
+    printf("========================================\n\n");
+}
+
+// Reconstruct full string in the same logical packing:
+//   idx = x * zs + z
+std::string reconstructFullMessage(const double* h_E, int Z0 = 0, int y0 = 0)
+{
+    std::string out;
+    out.reserve(xs * zs);
+
+    for (int x = 0; x < xs; ++x) {
+        for (int z = 0; z < zs; ++z) {
+            char c = (char)(int)lrint(
+                h_E[UID_6D(0, VAR_MSG, Z0, x, y0, z)]
+            );
+            if (c == 0) continue; // treat 0 as empty
+            out.push_back(c);
+        }
+    }
+    return out;
+}
+
+// -------- Per-cycle barrier state for persistent kernel --------
 __device__ volatile unsigned int g_threadsDone  = 0u;
 __device__ volatile int          g_activeCycle  = -1;
 
 __global__
-void persistentKernel(double* E,volatile int* d_CYC,volatile int* d_quit,volatile int* d_done){
+void persistentKernel(double* E,
+                      volatile int* d_CYC,
+                      volatile int* d_quit,
+                      volatile int* d_done)
+{
     const unsigned int tid = blockIdx.x * blockDim.x + threadIdx.x;
-
     const unsigned int numThreads = gridDim.x * blockDim.x;
 
-    const unsigned int TOTAL_TASKS = (unsigned int)Ys * (unsigned int)Zs * (unsigned int)xs * (unsigned int)ys;
+    const unsigned int TOTAL_TASKS =
+        (unsigned int)Ys * (unsigned int)Zs *
+        (unsigned int)xs * (unsigned int)ys;
 
     __syncthreads();
 
@@ -176,36 +219,37 @@ void persistentKernel(double* E,volatile int* d_CYC,volatile int* d_quit,volatil
             int Z0 = 0, x0 = 0, y0 = 0;
             int msg_len = zs;
 
+            // 1) Old per-x debug (x=0, x=1) kept for reference
             if (CYC >= msg_len - 1) {
-                
-                printf("CYC=%2lld  t_cur=%4.1f  t_back=%4.1f  msg_back=",CYC, (double)CYC, reconstructTemporalValueForOrder(E,0,VAR_T,Z0,x0,y0,z_cur,(2.0 - (double)CYC),Xs - 1));
 
-                for (int j = 0; j < msg_len; ++j) {
-                    int z_j = j % zs;
-                    char c = (char)(int)lrint(E[UID_6D(0,VAR_MSG,Z0,x0,y0,z_j)]);
-                    if (c == 0) c = '_';
-                    printf("%c", c);
+                double t_back = reconstructTemporalValueForOrder(
+                    E, 0, VAR_T,
+                    Z0, x0, y0, z_cur,
+                    (2.0 - (double)CYC),
+                    Xs - 1
+                );
+
+                printf("GPU debug: CYC=%2lld  t_cur=%4.1f  t_back=%4.1f  msg_back=",
+                       CYC, (double)CYC, t_back);
+
+                const int MAXLEN = xs * zs;
+                char buf[MAXLEN + 1];
+                int  pos = 0;
+                for (int x = 0; x < xs; ++x) {
+                    for (int z = 0; z < zs; ++z) {
+                        char c = (char)(int)lrint(
+                            E[UID_6D(0, VAR_MSG, Z0, x, y0, z)]
+                        );
+                        if (c == 0) continue;
+                        if (pos < MAXLEN) {
+                            buf[pos++] = c;
+                        }
+                    }
                 }
-                printf("\n");
+                buf[pos] = '\0';
+
+                printf("%s\n", buf);             
             }
-
-
-            int x1 = 1;
-            if (CYC >= msg_len - 1) {
-                
-                printf("CYC=%2lld  t_cur=%4.1f  t_back=%4.1f  msg_back=",CYC, (double)CYC, reconstructTemporalValueForOrder(E,0,VAR_T,Z0,x1,y0,z_cur,(2.0 - (double)CYC),Xs - 1));
-
-                for (int j = 0; j < msg_len; ++j) {
-                    int z_j = j % zs;
-                    char c = (char)(int)lrint(E[UID_6D(0,VAR_MSG,Z0,x1,y0,z_j)]);
-                    if (c == 0) c = '_';
-                    printf("%c", c);
-                }
-                printf("\n");
-            }
-
-
-
 
             *d_done = curCYC;
             __threadfence_system();  // flush to host-visible memory
@@ -214,7 +258,6 @@ void persistentKernel(double* E,volatile int* d_CYC,volatile int* d_quit,volatil
         localLastCYC = curCYC;
     }
 }
-
 
 int main()
 {
@@ -228,12 +271,11 @@ int main()
     CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
         &blocksPerSM,
         persistentKernel,
-        256,  // threads per block (below)
-        0     // dynamic shared memory
+        256,
+        0
     ));
 
     int maxBlocks = blocksPerSM * prop.multiProcessorCount;
-    // To be extra safe for persistence, we can cap at 1 block per SM:
     if (maxBlocks > prop.multiProcessorCount)
         maxBlocks = prop.multiProcessorCount;
 
@@ -269,24 +311,28 @@ int main()
     persistentKernel<<<blocks, threads>>>(d_E, d_CYC, d_quit, d_done);
     CUDA_CHECK(cudaGetLastError());
 
-    const char* msg0 = "helloworld";
-    const char* msg1 = "whatsgoing";
+    const char* msg = "helloworldwhatsgoing";
+    const int msgLen = strlen(msg);
 
+    if (msgLen > xs * zs) {
+        printf("ERROR: not enough xs*zs to store full string (%d chars needed, %d available)\n",msgLen, xs * zs);
+    }
+
+    // Layout: idx = x*zs + z
     for (int CYC = 0; CYC <= CYCS_TO_RUN; ++CYC) {
 
-        if (CYC < 10) {
-            char c0 = msg0[CYC];
-            char c1 = msg1[CYC];
-            int z_cur = CYC % zs;
-            for (int Z = 0; Z < Zs; ++Z)
-                for (int y = 0; y < ys; ++y)
-                    for (int x = 0; x < xs; ++x)
-                        if (x == 0){
-                            h_E[UID_6D(0, VAR_MSG, Z, x, y, z_cur)] = (double)c0;
-                        } else if (x == 1){
-                            h_E[UID_6D(0, VAR_MSG, Z, x, y, z_cur)] = (double)c1;
-                        }
-        }
+        int z_cur = CYC % zs;
+
+        for (int Z = 0; Z < Zs; ++Z)
+            for (int y = 0; y < ys; ++y)
+                for (int x = 0; x < xs; ++x) {
+                    int idx = x * zs + z_cur;  // global char index
+                    char c = 0;
+                    if (idx < msgLen) {
+                        c = msg[idx];
+                    }
+                    h_E[UID_6D(0, VAR_MSG, Z, x, y, z_cur)] = (double)c;
+                }
 
         *h_CYC = CYC;
 
@@ -298,6 +344,11 @@ int main()
     *h_quit = 1;
     cudaDeviceSynchronize();
 
+    // -------- Host-side inspection of final MSG layout --------
+    dumpMsgLayout(h_E, /*Z0=*/0, /*y0=*/0);
+    std::string fullMsg = reconstructFullMessage(h_E, /*Z0=*/0, /*y0=*/0);
+    std::cout << "Full reconstructed message (host): [" << fullMsg << "]\n";
+
     CUDA_CHECK(cudaFreeHost((void*)h_E));
     CUDA_CHECK(cudaFreeHost((void*)h_CYC));
     CUDA_CHECK(cudaFreeHost((void*)h_quit));
@@ -305,4 +356,3 @@ int main()
 
     return 0;
 }
-
